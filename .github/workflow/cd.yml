@@ -1,0 +1,98 @@
+name: CD Pipeline
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_FRONTEND: ${{ secrets.REGISTRY_URL }}/frontend:${{ github.sha }}
+  IMAGE_BACKEND: ${{ secrets.REGISTRY_URL }}/backend:${{ github.sha }}
+  AZURE_FRONTEND_WEBAPP: ${{ secrets.AZURE_FRONTEND_WEBAPP }}
+  AZURE_BACKEND_WEBAPP: ${{ secrets.AZURE_BACKEND_WEBAPP }}
+  AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+
+jobs:
+  deploy-staging:
+    name: Deploy to staging slot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy backend to staging slot
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_BACKEND_WEBAPP }}
+          images: ${{ env.IMAGE_BACKEND }}
+          slot-name: staging
+
+      - name: Deploy frontend to staging slot
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_FRONTEND_WEBAPP }}
+          images: ${{ env.IMAGE_FRONTEND }}
+          slot-name: staging
+
+      - name: Wait for staging deployment to settle
+        run: sleep 20
+
+      - name: Health check backend staging
+        run: |
+          set -e
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ env.AZURE_BACKEND_WEBAPP }}-staging.azurewebsites.net/api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Backend staging is healthy"
+              exit 0
+            fi
+            echo "Backend staging not ready yet ($code); retrying..."
+            sleep 10
+          done
+          echo "Backend staging health check failed" >&2
+          exit 1
+
+      - name: Smoke test frontend staging
+        run: |
+          set -e
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ env.AZURE_FRONTEND_WEBAPP }}-staging.azurewebsites.net/" || true)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "Frontend staging is reachable"
+              exit 0
+            fi
+            echo "Frontend staging not ready yet ($code); retrying..."
+            sleep 10
+          done
+          echo "Frontend staging smoke test failed" >&2
+          exit 1
+
+      - name: API smoke test
+        run: |
+          set -e
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ env.AZURE_BACKEND_WEBAPP }}-staging.azurewebsites.net/api/health" || true)
+          if [ "$code" != "200" ]; then
+            echo "API smoke test failed with status $code" >&2
+            exit 1
+          fi
+
+      - name: Swap staging slot into production
+        run: |
+          az webapp deployment slot swap \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_BACKEND_WEBAPP }}" \
+            --slot staging \
+            --target-slot production
+          az webapp deployment slot swap \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_FRONTEND_WEBAPP }}" \
+            --slot staging \
+            --target-slot production
