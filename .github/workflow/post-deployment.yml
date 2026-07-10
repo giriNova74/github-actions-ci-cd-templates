@@ -1,0 +1,90 @@
+name: Post-Deployment Pipeline
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AZURE_FRONTEND_WEBAPP: ${{ secrets.AZURE_FRONTEND_WEBAPP }}
+  AZURE_BACKEND_WEBAPP: ${{ secrets.AZURE_BACKEND_WEBAPP }}
+  ROLLBACK_SLOT: ${{ secrets.ROLLBACK_SLOT_NAME }}
+
+jobs:
+  post-deploy:
+    name: Post-deployment validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Health check backend production
+        run: |
+          set -e
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://${{ env.AZURE_BACKEND_WEBAPP }}.azurewebsites.net/api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Backend production is healthy"
+              exit 0
+            fi
+            echo "Backend not ready yet ($code); retrying..."
+            sleep 10
+          done
+          echo "Backend production health check failed" >&2
+          exit 1
+
+      - name: Health check frontend production
+        run: |
+          set -e
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://${{ env.AZURE_FRONTEND_WEBAPP }}.azurewebsites.net/" || true)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "Frontend production is reachable"
+              exit 0
+            fi
+            echo "Frontend not ready yet ($code); retrying..."
+            sleep 10
+          done
+          echo "Frontend production health check failed" >&2
+          exit 1
+
+      - name: Check metrics endpoint
+        continue-on-error: true
+        run: |
+          curl -fsS "https://${{ env.AZURE_BACKEND_WEBAPP }}.azurewebsites.net/metrics" -o /tmp/metrics.txt || echo "Metrics endpoint not available"
+          if [ -f /tmp/metrics.txt ]; then
+            echo "Metrics endpoint responded"
+          fi
+
+      - name: Notify deployment success
+        if: ${{ success() }}
+        run: echo "Deployment health checks passed. Production is healthy."
+
+      - name: Roll back deployment if required
+        if: ${{ failure() && env.ROLLBACK_SLOT != '' }}
+        run: |
+          echo "Health checks failed. Swapping rollback slot into production."
+          az webapp deployment slot swap \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_BACKEND_WEBAPP }}" \
+            --slot "${{ env.ROLLBACK_SLOT }}" \
+            --target-slot production
+          az webapp deployment slot swap \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ env.AZURE_FRONTEND_WEBAPP }}" \
+            --slot "${{ env.ROLLBACK_SLOT }}" \
+            --target-slot production
+
+      - name: Fail when rollback is required but not configured
+        if: ${{ failure() && env.ROLLBACK_SLOT == '' }}
+        run: |
+          echo "Health checks failed and no rollback slot is configured." >&2
+          exit 1
