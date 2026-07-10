@@ -1,0 +1,50 @@
+name: Orchestrator Pipeline
+
+on:
+  push:
+    branches:
+      - feature/pgadmin-auth
+      - main
+  pull_request:
+    branches:
+      - feature/pgadmin-auth
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  ci:
+    name: CI stage
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  security:
+    name: Security stage
+    needs: ci
+    if: ${{ needs.ci.result == 'success' }}
+    uses: ./.github/workflows/security.yml
+    secrets: inherit
+
+  build:
+    name: Build stage
+    needs: security
+    if: ${{ needs.security.result == 'success' }}
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  deploy:
+    name: Deployment stage
+    needs: build
+    if: ${{ needs.build.result == 'success' }}
+    uses: ./.github/workflows/cd.yml
+    secrets: inherit
+
+  post-deployment:
+    name: Post-deployment stage
+    needs: deploy
+    if: ${{ needs.deploy.result == 'success' }}
+    uses: ./.github/workflows/post-deployment.yml
+    secrets: inherit
